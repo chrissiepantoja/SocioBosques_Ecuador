@@ -1,7 +1,4 @@
 # SocioBosques—Ecuador
-
-This repository contains the reproducibility package for:
-
 **“Ecopayments’ Deforestation Impacts on Highly Intervened Frontiers: Extending Ecuador’s Evidence in Light of Amazon Policy Interactions”**
 
 ## Authors
