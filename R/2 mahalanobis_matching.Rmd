@@ -1,0 +1,433 @@
+---
+title: "Mahalanobis Distance Matching & Covariate Balance Diagnostics"
+author: "Andrew (Daye) Zhai & Chrissie A. Pantoja Vallejos"
+subtitle: "Sociobosque, Ecuador"
+output: html_document
+---
+
+This R Markdown reproduces the Stata do-file's Mahalanobis distance matching (MDM)
+pipeline. Stata's `psmatch2, mahalanobis(...)` is replaced with `MatchIt::matchit()`
+using `distance = "mahalanobis"`, `method = "nearest"`, `ratio = 1`, and a caliper —
+the closest R equivalent to `n(1) caliper(0.1)`.
+
+Rather than copy-pasting the same matching block once per subgroup (as the .do file
+does ~10 times for Collective / Individual / PA populations, each split into
+SB-only / SB+IT / SB+PA / SB+IT+PA), the logic is written once as a set of
+functions and then called with different filters. This section fully implements
+**300×300, Collective, Never-treated** (all four sub-restrictions).
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(MatchIt)
+
+project_dir <- "/Users/chrissiepantoja/Library/CloudStorage/GoogleDrive-chrissiepantoja@gmail.com/My Drive/SocioBosques_Ecuador"
+data_dir <- project_dir
+
+covariates <- c("road", "village", "river", "population",
+                "oil", "pipelines", "slope", "elevation")
+cv <- c("farming", "mining", "infrastruct")
+```
+
+## Core matching functions
+
+### `mdm_cohort_never()` — matches never-treated vs. cohort-treated, within state
+
+Translates the `mdm_cohort_never` Stata program. Adds up to 10 years of
+pre-treatment `forestloss` covariates (any that exist for `cohort-10` to
+`cohort-1`), builds treated/control flags, then matches separately within each
+state.
+
+```{r mdm-cohort-never}
+mdm_cohort_never <- function(data, cohort, covariates) {
+
+  pre_years <- (cohort - 10):(cohort - 1)
+  loss_vars <- paste0("forestloss", pre_years)
+  loss_vars <- loss_vars[loss_vars %in% names(data)]
+  covars <- c(covariates, loss_vars)
+
+  missing_covars <- covars[!covars %in% names(data)]
+  if (length(missing_covars) > 0) {
+    message("Missing covariates: ", paste(missing_covars, collapse = ", "))
+    return(NULL)
+  }
+
+  d <- data %>%
+    mutate(
+      treated = as.integer(first_treat == cohort &
+                              within_sociobosque == TRUE &
+                              pixel_percent_intersect_sociobosque >= 0.5),
+      control = as.integer(first_treat == 0 |
+                              is.na(within_sociobosque) |
+                              pixel_percent_intersect_sociobosque < 0.5)
+    ) %>%
+    filter(treated == 1 | control == 1)
+
+  message("\n========== Processing cohort ", cohort, " ==========")
+  n_treated <- sum(d$treated == 1, na.rm = TRUE)
+  message("Treated group samples: ", n_treated)
+  if (n_treated <= 1) {
+    message("Insufficient treated units for cohort ", cohort, ". Skipping.")
+    return(NULL)
+  }
+  n_control <- sum(d$control == 1, na.rm = TRUE)
+  message("Control group candidates: ", n_control)
+  if (n_control == 0) {
+    message("No control candidates for cohort ", cohort, ". Skipping.")
+    return(NULL)
+  }
+
+  states <- d %>%
+    filter(treated == 1, !is.na(state)) %>%
+    distinct(state) %>%
+    pull(state)
+
+  matched_list <- map(states, function(s) {
+    message("========== Matching within cohort ", cohort, ", state = ", s, " ==========")
+    ds <- d %>% filter(state == s)
+
+    n_t <- sum(ds$treated == 1, na.rm = TRUE)
+    message("Treated group samples: ", n_t)
+    if (n_t <= 1) {
+      message("Insufficient treated pixels in state = ", s, ". Skipping.")
+      return(NULL)
+    }
+    n_c <- sum(ds$control == 1, na.rm = TRUE)
+    message("Control group candidates: ", n_c)
+    if (n_c <= 2) {
+      message("Insufficient control group candidates in state = ", s, ". Skipping.")
+      return(NULL)
+    }
+
+    fml <- as.formula(paste("treated ~", paste(covars, collapse = " + ")))
+    m <- tryCatch(
+      matchit(fml, data = ds, distance = "mahalanobis",
+              method = "nearest", ratio = 1, caliper = 0.1),
+      error = function(e) {
+        message("Matching failed for state = ", s, ": ", conditionMessage(e))
+        NULL
+      }
+    )
+    if (is.null(m)) return(NULL)
+
+    md <- match.data(m)  # adds distance, weights, subclass
+    md %>%
+      select(pointid, x, y, polygonid, treated,
+             all_of(covars), weights) %>%
+      rename(`_treated` = treated, `_weight` = weights) %>%
+      mutate(cohort_year = cohort, state_match = s)
+  })
+
+  all_matched <- bind_rows(matched_list)
+
+  if (nrow(all_matched) > 0) {
+    write_csv(all_matched, file.path(data_dir, paste0("matched_cohort_", cohort, ".csv")))
+  } else {
+    message("No matched pairs produced for cohort ", cohort, ".")
+  }
+
+  all_matched
+}
+```
+
+### `mdm_cohort_never_pa()` — same, but also split by `year_pa` within state
+
+Translates `mdm_cohort_never_pa`: identical to the function above, except
+matching is nested by state *and* protected-area designation year.
+
+```{r mdm-cohort-never-pa}
+mdm_cohort_never_pa <- function(data, cohort, covariates) {
+
+  pre_years <- (cohort - 10):(cohort - 1)
+  loss_vars <- paste0("forestloss", pre_years)
+  loss_vars <- loss_vars[loss_vars %in% names(data)]
+  covars <- c(covariates, loss_vars)
+
+  missing_covars <- covars[!covars %in% names(data)]
+  if (length(missing_covars) > 0) {
+    message("Missing covariates: ", paste(missing_covars, collapse = ", "))
+    return(NULL)
+  }
+
+  d <- data %>%
+    mutate(
+      treated = as.integer(first_treat == cohort &
+                              within_sociobosque == TRUE &
+                              pixel_percent_intersect_sociobosque >= 0.5),
+      control = as.integer(first_treat == 0 |
+                              is.na(within_sociobosque) |
+                              pixel_percent_intersect_sociobosque < 0.5)
+    ) %>%
+    filter(treated == 1 | control == 1)
+
+  message("\n========== Processing cohort ", cohort, " ==========")
+  n_treated <- sum(d$treated == 1, na.rm = TRUE)
+  message("Treated group samples: ", n_treated)
+  if (n_treated <= 1) {
+    message("Insufficient treated units for cohort ", cohort, ". Skipping.")
+    return(NULL)
+  }
+  n_control <- sum(d$control == 1, na.rm = TRUE)
+  message("Control group candidates: ", n_control)
+  if (n_control == 0) {
+    message("No control group candidates for cohort ", cohort, ". Skipping.")
+    return(NULL)
+  }
+
+  states <- d %>%
+    filter(treated == 1, !is.na(state)) %>%
+    distinct(state) %>%
+    pull(state)
+
+  matched_list <- map(states, function(s) {
+    years_pa <- d %>%
+      filter(treated == 1, state == s, !is.na(year_pa)) %>%
+      distinct(year_pa) %>%
+      pull(year_pa)
+
+    map(years_pa, function(ypa) {
+      message("========== Matching within cohort ", cohort, ", state = ", s,
+              ", year_pa = ", ypa, " ==========")
+      ds <- d %>% filter(state == s, year_pa == ypa)
+
+      n_t <- sum(ds$treated == 1, na.rm = TRUE)
+      message("Treated group samples: ", n_t)
+      if (n_t <= 1) {
+        message("Insufficient treated pixels in state = ", s,
+                " and year_pa = ", ypa, ". Skipping.")
+        return(NULL)
+      }
+      n_c <- sum(ds$control == 1, na.rm = TRUE)
+      message("Control group candidates: ", n_c)
+      if (n_c <= 2) {
+        message("Insufficient control group candidates in state = ", s,
+                " and year_pa = ", ypa, ". Skipping.")
+        return(NULL)
+      }
+
+      fml <- as.formula(paste("treated ~", paste(covars, collapse = " + ")))
+      m <- tryCatch(
+        matchit(fml, data = ds, distance = "mahalanobis",
+                method = "nearest", ratio = 1, caliper = 0.1),
+        error = function(e) {
+          message("Matching failed for state = ", s, ", year_pa = ", ypa, ": ",
+                  conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(m)) return(NULL)
+
+      md <- match.data(m)
+      md %>%
+        select(pointid, x, y, polygonid, treated, state, year_pa,
+               all_of(covars), weights) %>%
+        rename(`_treated` = treated, `_weight` = weights) %>%
+        mutate(cohort_year = cohort, state_match = s, pa_match_year = ypa)
+    })
+  }) %>% flatten()
+
+  all_matched <- bind_rows(matched_list)
+
+  if (nrow(all_matched) > 0) {
+    write_csv(all_matched, file.path(data_dir, paste0("matched_cohort_", cohort, ".csv")))
+  } else {
+    message("No matched pairs produced for cohort ", cohort, ".")
+  }
+
+  all_matched
+}
+```
+
+## Generalized pipeline (replaces the repeated copy-pasted blocks)
+
+`run_mdm_pipeline()` reproduces steps 2–6 that appear after every `di "*==...=="`
+header in the .do file: run matching per cohort, consolidate matched pairs, drop
+unmatched observations, reshape to long, save. `restriction_filter` is a
+tidy-eval expression standing in for lines like `keep if pa == "NA" & indigenous == "NA"`.
+
+```{r run-pipeline}
+run_mdm_pipeline <- function(data, years, restriction_filter, mdm_fun,
+                              covariates, base_data_for_reshape, label) {
+
+  # Step 2: matching per cohort
+  matched_by_cohort <- map(years, function(yr) {
+    d <- data %>% filter(!!restriction_filter)
+    message("========== Processing cohort ", yr, " ==========")
+    mdm_fun(d, yr, covariates)
+  })
+
+  # Step 3: consolidate matched pairs
+  matched_by_cohort_nonempty <- compact(matched_by_cohort)
+  if (length(matched_by_cohort_nonempty) == 0) {
+    warning("No cohort produced any matched units for '", label,
+            "' — every cohort had 0 treated or 0 control candidates. ",
+            "See the per-cohort messages above. Returning NULL for this label.")
+    return(NULL)
+  }
+
+  all_matched_raw <- bind_rows(matched_by_cohort_nonempty) %>%
+    distinct(pointid, cohort_year, .keep_all = TRUE) %>%
+    arrange(pointid, cohort_year, `_treated`) %>%
+    filter(!is.na(`_treated`))  # rule out obs not included in matching
+
+  write_csv(all_matched_raw,
+            file.path(data_dir, paste0("all_unmatched_pairs_wide_300_", label, ".csv")))
+
+  # Step 4: keep only common-support / weighted matches
+  all_matched <- all_matched_raw %>% filter(!is.na(`_weight`))
+  write_csv(all_matched,
+            file.path(data_dir, paste0("all_matched_pairs_wide_300_", label, ".csv")))
+
+  # Step 5: clean temp per-cohort files
+  walk(years, function(yr) {
+    f <- file.path(data_dir, paste0("matched_cohort_", yr, ".csv"))
+    if (file.exists(f)) file.remove(f)
+  })
+
+  # Step 6: reshape wide -> long and merge back full covariate history
+  long_data <- all_matched %>%
+    select(-starts_with("forestloss")) %>%
+    mutate(newid = paste(pointid, cohort_year, sep = "_")) %>%
+    inner_join(base_data_for_reshape, by = "pointid", suffix = c("", ".full")) %>%
+    pivot_longer(
+      cols = matches("^(forestcover|forestloss|relforestloss|farming|mining|infrastruct)\\d{4}$"),
+      names_to = c(".value", "year"),
+      names_pattern = "^(forestcover|forestloss|relforestloss|farming|mining|infrastruct)(\\d{4})$"
+    ) %>%
+    mutate(year = as.integer(year),
+           panel_id = as.integer(factor(newid)))
+
+  write_csv(long_data, file.path(data_dir, paste0("SBP_long_300_did_", label, ".csv")))
+  message("Completed: ", label)
+  long_data
+}
+```
+
+## 300×300, Collective, Never-treated
+
+```{r collective-setup}
+sbp_wide_300 <- read_csv(file.path(data_dir, "SBP_wide_300.csv"), show_col_types = FALSE)
+
+cover_vars <- paste0("forestcover", 1997:2020)
+
+sbp_wide_300_collective <- sbp_wide_300 %>%
+  mutate(
+    treatment_year = if_else(is.na(sociobosque_year), 9999L, sociobosque_year),
+    first_treat = if_else(is.na(sociobosque_year), 0L, sociobosque_year)
+  ) %>%
+  filter(sociobosque_type == "COLECTIVO" | is.na(sociobosque_type)) %>%
+  mutate(max_cover_pre = pmax(!!!syms(cover_vars), na.rm = TRUE)) %>%
+  filter(max_cover_pre > 0.3) %>%
+  select(-max_cover_pre) %>%
+  filter(!((is.na(within_sociobosque) & pixel_percent_intersect_sociobosque >= 0.5) |
+             (within_sociobosque == TRUE & pixel_percent_intersect_sociobosque < 0.5)))
+
+write_csv(sbp_wide_300_collective, file.path(data_dir, "SBP_wide_300_Collective.csv"))
+
+years <- sbp_wide_300_collective %>%
+  filter(!is.na(sociobosque_year)) %>%
+  distinct(sociobosque_year) %>%
+  pull(sociobosque_year) %>%
+  sort()
+```
+
+### SB Only
+
+```{r collective-sb-only}
+run_mdm_pipeline(
+  data = sbp_wide_300_collective,
+  years = years,
+  restriction_filter = quo(is.na(pa) & is.na(indigenous)),
+  mdm_fun = mdm_cohort_never,
+  covariates = covariates,
+  base_data_for_reshape = sbp_wide_300_collective,
+  label = "Collective_mdm_Never-treated_sb"
+)
+```
+
+### SB + IT
+
+```{r collective-sb-it}
+run_mdm_pipeline(
+  data = sbp_wide_300_collective,
+  years = years,
+  restriction_filter = quo(!is.na(indigenous) & is.na(pa)),
+  mdm_fun = mdm_cohort_never,
+  covariates = covariates,
+  base_data_for_reshape = sbp_wide_300_collective,
+  label = "Collective_mdm_Never-treated_sb+it"
+)
+```
+
+### SB + PA
+
+```{r collective-sb-pa}
+run_mdm_pipeline(
+  data = sbp_wide_300_collective,
+  years = years,
+  restriction_filter = quo(!is.na(pa) & is.na(indigenous)),
+  mdm_fun = mdm_cohort_never_pa,
+  covariates = covariates,
+  base_data_for_reshape = sbp_wide_300_collective,
+  label = "Collective_mdm_Never-treated_sb+pa"
+)
+```
+
+### SB + IT + PA
+
+```{r collective-sb-it-pa}
+run_mdm_pipeline(
+  data = sbp_wide_300_collective,
+  years = years,
+  restriction_filter = quo(!is.na(pa) & !is.na(indigenous)),
+  mdm_fun = mdm_cohort_never_pa,
+  covariates = covariates,
+  base_data_for_reshape = sbp_wide_300_collective,
+  label = "Collective_mdm_Never-treated_sb+it+pa"
+)
+```
+
+### Covariate balance diagnostics for the whole sample
+
+The `pstest`/`asdoc` Word export and `graph combine` figure are Stata-specific
+reporting steps. The R equivalent is the `cobalt` package's `bal.tab()` /
+`love.plot()`, working off the four appended matched files:
+
+```{r covariate-balance, eval=FALSE}
+library(cobalt)
+
+all_collective <- bind_rows(
+  read_csv(file.path(data_dir, "all_unmatched_pairs_wide_300_Collective_mdm_Never-treated_sb.csv"), na = "", show_col_types = FALSE),
+  read_csv(file.path(data_dir, "all_unmatched_pairs_wide_300_Collective_mdm_Never-treated_sb+it.csv"), na = "", show_col_types = FALSE),
+  read_csv(file.path(data_dir, "all_unmatched_pairs_wide_300_Collective_mdm_Never-treated_sb+pa.csv"), na = "", show_col_types = FALSE),
+  read_csv(file.path(data_dir, "all_unmatched_pairs_wide_300_Collective_mdm_Never-treated_sb+it+pa.csv"), na = "", show_col_types = FALSE)
+)
+
+# love.plot / bal.tab replace pstest's dot chart, histogram, and scatter plot
+bal.tab(`_treated` ~ ., data = all_collective, weights = all_collective$`_weight`,
+        method = "matching")
+```
+
+## Not yet converted
+
+This file is one section of a much larger (~1,600-line) pipeline. Still to
+translate, if useful:
+
+- **Individual, Never-treated** and **PA, Never-treated** sections (lines
+  507–928) — identical pattern to above, just swap the `sociobosque_type`/`pa`
+  filter, so they can reuse `run_mdm_pipeline()` directly.
+- **`mdm_cohort_itcc_sbit`** and **`mdm_cohort_itcc_sbit_state`** programs
+  (Individual-as-treated, Collective-as-control) — a third matching variant,
+  lines 1005–1156.
+- The **Mata block** (lines 453–478) that repacks each row's forestloss values
+  into `forestloss_pre1`–`forestloss_pre10` — straightforward in R with
+  `apply()`/`pmap()`, but I didn't want to guess at exact behavior without
+  seeing it used downstream.
+- **`dcdh_effect_export_rate`** (end of file) — a post-estimation helper for a
+  De Chaisemartin–D'Haultfœuille DiD estimator; this would map to whichever R
+  package you're using for that estimator (e.g. `DIDmultiplegt`), not `MatchIt`.
+
+Let me know which of these you want next, or if you'd like the whole file
+finished in one pass.

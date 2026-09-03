@@ -1,0 +1,298 @@
+This document imports, processes, and merges the SocioBosque CSV files for the 900- and 300-point samples.
+
+**NA convention used throughout this pipeline and all downstream analysis:**
+missing / not-applicable is always the real R `NA` — never the literal text `"NA"`.
+Categorical columns (`sociobosque_type`, `pa`, `indigenous`, `within_sociobosque`)
+use real `NA` for "not treated" / "not in a protected area" / "not indigenous land" /
+"unknown". Downstream code should test with `is.na(x)` / `!is.na(x)`, never
+`x == "NA"` — string comparisons against `"NA"` are fragile and were the source of
+earlier bugs. CSVs are written with `na = ""` (blank cells) so no ambiguous `"NA"`
+text is ever persisted to disk.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+
+project_dir <- "/Users/chrissiepantoja/Library/CloudStorage/GoogleDrive-chrissiepantoja@gmail.com/My Drive/SocioBosques_Ecuador"
+csv_dir <- file.path(project_dir, "processed_data", "csvs")
+
+amazon_provinces <- c(
+  "MORONA SANTIAGO", "NAPO", "ORELLANA", "PASTAZA",
+  "SUCUMBIOS", "ZAMORA CHINCHIPE"
+)
+```
+
+## Protected-area years
+
+```{r protected-area-years}
+pa_years <- c(
+  "ANTISANA" = 1993, "CAJAS" = 1997, "CAYAMBE COCA" = 1970,
+  "CERRO PLATEADO" = 2010, "CHIMBORAZO" = 1987,
+  "COFAN BERMEJO" = 2002, "COLONSO CHALUPAS" = 2014,
+  "CORDILLERA ORIENTAL DEL CARCHI" = 2019, "COTOPAXI" = 1975,
+  "CUYABENO" = 1979, "EL BOLICHE" = 1979, "EL CONDOR" = 1999,
+  "EL QUIMI" = 2006, "EL ZARZA" = 2006, "LA BONITA" = 2017,
+  "LIMONCOCHA" = 1985, "LLANGANATES" = 1996,
+  "LOS ILINIZAS" = 1996, "MARCOS PEREZ DE CASTILLA" = 1999,
+  "PODOCARPUS" = 1982, "QUIMSACOCHA" = 2012,
+  "RIO NEGRO SOPLADORA" = 2018, "SANGAY" = 1975,
+  "SIETE IGLESIAS" = 2012, "SUMACO NAPO-GALERAS" = 1994,
+  "TAMBILLO" = 2018, "YACURI" = 2009, "YASUNI" = 1979
+)
+```
+
+## Helper functions
+
+```{r helper-functions}
+# na = c("", "NA") is explicit here (it's readr's default too) so that any
+# literal "NA" text or blank cell in the raw source files becomes a real R NA
+# right at ingest, before it can propagate through merges and comparisons.
+#
+# guess_max = Inf forces read_csv to scan the ENTIRE file (not just the first
+# 1000 rows) when guessing each column's type. With guess_max left at its
+# default, a column type guessed from an early homogeneous slice of the file
+# (e.g. if SocioBosque-enrolled points happen to be listed first) can cause
+# every value elsewhere that doesn't fit that guess to be silently turned into
+# NA or garbled — exactly the "one or more parsing issues" warning, and the
+# likely cause of sociobosque_type/within_sociobosque looking artificially
+# uniform. If a file is very large this is slower, but correctness comes first
+# here; problems() is also called immediately so any remaining issue is
+# visible right away instead of silently downstream.
+read_csv_file <- function(name) {
+  path <- file.path(csv_dir, name)
+  dat <- read_csv(path, na = c("", "NA"), guess_max = Inf, show_col_types = FALSE)
+  probs <- problems(dat)
+  if (nrow(probs) > 0) {
+    warning(
+      "Parsing problems in ", name, " (", nrow(probs), " issue(s)). ",
+      "First few:\n",
+      paste(capture.output(print(head(probs, 5))), collapse = "\n")
+    )
+  }
+  dat
+}
+
+matched_merge <- function(x, y) {
+  if (anyDuplicated(x$pointid) || anyDuplicated(y$pointid)) {
+    stop("pointid must be unique in both datasets for a 1:1 merge.")
+  }
+  inner_join(x, y, by = "pointid")
+}
+
+encode_integer <- function(x) {
+  as.integer(factor(x))
+}
+```
+
+## Process forest data
+
+```{r process-forest}
+process_forest <- function(size) {
+  prefix <- paste0("sample_", size, "_")
+  forest <- read_csv_file(paste0(prefix, "forest.csv"))
+
+  for (year in 1997:2020) {
+    previous_year <- year - 1
+
+    forest[[paste0("forestloss", year)]] <-
+      forest[[paste0("mapbiomas", previous_year)]] -
+      forest[[paste0("mapbiomas", year)]]
+
+    loss_name <- paste0("mapbiomasloss", year)
+    if (loss_name %in% names(forest)) forest[[loss_name]] <- NULL
+
+    forest[[paste0("relforestloss", year)]] <-
+      forest[[paste0("forestloss", year)]] /
+      forest[[paste0("mapbiomas", previous_year)]]
+  }
+
+  names(forest)[match(paste0("mapbiomas", 1996:2020), names(forest))] <-
+    paste0("forestcover", 1996:2020)
+
+  forest
+}
+```
+
+## Process and merge one sample
+
+```{r process-sample}
+process_sample <- function(size) {
+  prefix <- paste0("sample_", size, "_")
+  data <- matched_merge(
+    read_csv_file(paste0(prefix, "spatial_attr.csv")),
+    process_forest(size)
+  )
+
+  farming <- read_csv_file(paste0(prefix, "outcome14.csv")) %>%
+    select(-matches("^mapbiomasloss"))
+  names(farming)[match(paste0("mapbiomas", 1996:2020), names(farming))] <-
+    paste0("farming", 1996:2020)
+  data <- matched_merge(data, farming)
+
+  mining <- read_csv_file(paste0(prefix, "outcome24.csv")) %>%
+    select(-matches("^mapbiomasloss"))
+  names(mining)[match(paste0("mapbiomas", 1996:2020), names(mining))] <-
+    paste0("mining", 1996:2020)
+  data <- matched_merge(data, mining)
+
+  infrastructure <- read_csv_file(paste0(prefix, "outcome30.csv")) %>%
+    select(-matches("^mapbiomasloss"))
+  names(infrastructure)[match(paste0("mapbiomas", 1996:2020), names(infrastructure))] <-
+    paste0("infrastruct", 1996:2020)
+  data <- matched_merge(data, infrastructure)
+
+  covariates <- read_csv_file(paste0(prefix, "covs.csv")) %>%
+    rename(village = poblados)
+  data <- matched_merge(data, covariates)
+
+  protected <- read_csv_file(paste0(prefix, "PA.csv")) %>%
+    mutate(
+      year_pa = unname(pa_years[nam]),
+      protected_areas = encode_integer(subap),
+      pa = subap
+    ) %>%
+    select(pointid, subap, year_pa, protected_areas, pa)
+  data <- matched_merge(data, protected)
+
+  indigenous <- read_csv_file(paste0(prefix, "indigenous_new.csv")) %>%
+    select(pointid, status) %>%
+    mutate(
+      indigenous_land = encode_integer(status),
+      indigenous = status,
+      within_indigenous = as.integer(!is.na(status))
+    )
+  data <- matched_merge(data, indigenous)
+
+  soil <- read_csv_file(paste0(prefix, "soil.csv"))
+
+  if (!"shape_area" %in% names(soil)) {
+    possible_area_names <- c(
+      "shape_area",
+      "shapearea",
+      "area",
+      "area_m2",
+      "shape_area_1",
+      "area_ha"
+    )
+
+    area_name <- names(soil)[
+      match(tolower(possible_area_names), tolower(names(soil)))
+    ]
+    area_name <- area_name[!is.na(area_name)][1]
+
+    if (is.na(area_name)) {
+      stop(
+        "The soil file does not contain a shape-area column.\n",
+        "Available columns are: ",
+        paste(names(soil), collapse = ", ")
+      )
+    }
+
+    soil <- soil %>%
+      rename(shape_area = all_of(area_name))
+  }
+
+  soil <- soil %>%
+    select(pointid, pen_cod, text1_cod, shape_area) %>%
+    mutate(
+      slope = encode_integer(pen_cod),
+      soil = encode_integer(text1_cod),
+      polygonid = encode_integer(as.character(shape_area))
+    ) %>%
+    select(-pen_cod, -text1_cod, -shape_area)
+  data <- matched_merge(data, soil)
+
+  canton_raw <- read_csv_file(paste0(prefix, "cantones.csv"))
+
+  canton_id_candidates <- c("dpa_canton", "dpa_can", "canton_id")
+  canton_name_candidates <- c("dpa_descan", "dpa_des", "canton", "canton_name")
+
+  canton_id_name <- names(canton_raw)[
+    match(tolower(canton_id_candidates), tolower(names(canton_raw)))
+  ]
+  canton_id_name <- canton_id_name[!is.na(canton_id_name)][1]
+
+  canton_desc_name <- names(canton_raw)[
+    match(tolower(canton_name_candidates), tolower(names(canton_raw)))
+  ]
+  canton_desc_name <- canton_desc_name[!is.na(canton_desc_name)][1]
+
+  if (is.na(canton_id_name) || is.na(canton_desc_name)) {
+    stop(
+      "The cantones file does not contain the expected canton id/name columns.\n",
+      "Available columns are: ",
+      paste(names(canton_raw), collapse = ", ")
+    )
+  }
+
+  canton <- canton_raw %>%
+    select(pointid, all_of(canton_id_name), all_of(canton_desc_name)) %>%
+    rename(canton = all_of(canton_desc_name), cantonid = all_of(canton_id_name))
+  data <- matched_merge(data, canton)
+
+  coordinates <- read_csv_file(paste0(prefix, "coord.csv"))
+
+  data %>%
+    matched_merge(coordinates) %>%
+    mutate(
+      state = toupper(trimws(as.character(state)))
+    ) %>%
+    filter(state %in% amazon_provinces) %>%
+    mutate(
+      stateid = encode_integer(state),
+      sbp_type = encode_integer(sociobosque_type),
+      # within_sociobosque arrives as text ("TRUE"/"FALSE"/blank/"NA") from the
+      # raw files; coerce to a real logical so downstream code can use it
+      # directly (if (within_sociobosque)) or test missingness with is.na(),
+      # instead of comparing against the string "TRUE"/"NA".
+      within_sociobosque = case_when(
+        toupper(trimws(as.character(within_sociobosque))) == "TRUE" ~ TRUE,
+        toupper(trimws(as.character(within_sociobosque))) == "FALSE" ~ FALSE,
+        TRUE ~ NA
+      ),
+      withinsb = as.integer(within_sociobosque),
+      sociobosque_year = parse_integer(as.character(sociobosque_year)),
+      cantonid = parse_integer(as.character(cantonid)),
+      elevation = parse_number(as.character(elevation)),
+      # explicit, unambiguous indicator flags — TRUE/FALSE, never a string to compare against
+      has_pa = !is.na(pa),
+      has_indigenous = !is.na(indigenous)
+    )
+}
+```
+
+## Create the samples
+
+```{r create-samples}
+SBP_wide_900 <- process_sample(900)
+SBP_wide_300 <- process_sample(300)
+```
+
+## Export to CSV
+
+```{r export-csv}
+# na = "" writes missing values as blank cells, never as the text "NA" —
+# this is what makes "NA" unambiguous downstream (it never appears as data).
+write_csv(
+  SBP_wide_900,
+  file.path(project_dir, "SBP_wide_900.csv"),
+  na = ""
+)
+
+write_csv(
+  SBP_wide_300,
+  file.path(project_dir, "SBP_wide_300.csv"),
+  na = ""
+)
+```
+
+## Check the merged datasets
+
+```{r check-results}
+glimpse(SBP_wide_900)
+glimpse(SBP_wide_300)
+
+nrow(SBP_wide_900)
+nrow(SBP_wide_300)
+```
+

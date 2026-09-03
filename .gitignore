@@ -1,2 +1,7 @@
 .DS_Store
 .Rhistory
+**/.git/
+SocioBosques_Ecuador/
+**/.RData
+**/.Rapp.history
+**/*.lock
