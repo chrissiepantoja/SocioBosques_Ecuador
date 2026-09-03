@@ -13,7 +13,7 @@ text is ever persisted to disk.
 library(readr)
 library(dplyr)
 
-project_dir <- "/Users/chrissiepantoja/Library/CloudStorage/GoogleDrive-chrissiepantoja@gmail.com/My Drive/SocioBosques_Ecuador"
+project_dir <- "/Users/chrissiepantoja/Library/CloudStorage/GoogleDrive-chrissiepantoja@gmail.com/My Drive/GitHub/SocioBosques_Ecuador"
 csv_dir <- file.path(project_dir, "processed_data", "csvs")
 
 amazon_provinces <- c(
